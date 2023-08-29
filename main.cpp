@@ -1,17 +1,11 @@
-#include "hardware/structs/rosc.h"
-
 #include <string.h>
-#include <time.h>
 
 #include "pico/stdlib.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdio_usb.h"
 
-#include "lwip/pbuf.h"
-#include "lwip/tcp.h"
 #include "lwip/dns.h"
 
-#include "lwip/altcp_tcp.h"
 #include "lwip/altcp_tls.h"
 #include "lwip/apps/mqtt.h"
 
@@ -24,12 +18,14 @@
 
 #define DEBUG_printf printf
 
-#define MQTT_TLS 0 // needs to be 1 for AWS IoT. Also set published QoS to 0 or 1
-
-//#include "crypto_consts.h"
-
 #define MQTT_SERVER_HOST "192.168.1.31"
 #define MQTT_SERVER_PORT 1883
+#define IMAGE_WIDTH 128
+#define IMAGE_HEIGHT 128
+#define SCREEN_PADDING_LEFT 56
+#define SCREEN_PADDING_TOP 4
+#define BUFFER_SIZE (IMAGE_WIDTH * IMAGE_HEIGHT * 3)
+#define MQTT_TOPIC "ledmoji/128x128"
 
 typedef struct MQTT_CLIENT_T_ {
     ip_addr_t remote_addr;
@@ -48,10 +44,6 @@ PicoGraphics_PenRGB332 graphics(st7789.width, st7789.height, nullptr);
 // Perform initialisation
 static MQTT_CLIENT_T* mqtt_client_init(void) {
     auto *state = new MQTT_CLIENT_T;//calloc(1, sizeof(MQTT_CLIENT_T));
-//    if (!state) {
-//        DEBUG_printf("failed to allocate state\n");
-//        return NULL;
-//    }
     state->received = 0;
     return state;
 }
@@ -86,30 +78,42 @@ void run_dns_lookup(MQTT_CLIENT_T *state) {
 }
 
 u32_t data_in = 0;
-
-u8_t buffer[1025];
-u8_t data_len = 0;
+u32_t data_len = 0;
+u8_t buffer[BUFFER_SIZE];
 
 static void mqtt_pub_start_cb(void *arg, const char *topic, u32_t tot_len) {
     DEBUG_printf("mqtt_pub_start_cb: topic %s\n", topic);
 
-    if (tot_len > 1024) {
-        DEBUG_printf("Message length exceeds buffer size, discarding");
+    if (tot_len > BUFFER_SIZE) {
+        DEBUG_printf("Message length exceeds buffer size, discarding\n");
     } else {
+        DEBUG_printf("Receiving messaged with len %d\n", tot_len);
         data_in = tot_len;
         data_len = 0;
     }
 }
 
 static void mqtt_pub_data_cb(void *arg, const u8_t *data, u16_t len, u8_t flags) {
+//    DEBUG_printf("Received chunk with len %d. Total is %d\n", len, data_len);
     if (data_in > 0) {
         data_in -= len;
         memcpy(&buffer[data_len], data, len);
         data_len += len;
 
         if (data_in == 0) {
-            buffer[data_len] = 0;
-            DEBUG_printf("Message received: %s\n", &buffer);
+            DEBUG_printf("Message received! %d\n", data_len);
+            for (int32_t y = 0; y < IMAGE_HEIGHT; y++) {
+                for (int32_t x = 0; x < IMAGE_WIDTH; x++) {
+                    int32_t pos = (y * IMAGE_WIDTH + x) * 3;
+                    uint8_t red = buffer[pos];
+                    uint8_t green = buffer[pos + 1];
+                    uint8_t blue = buffer[pos + 2];
+                    graphics.set_pen(red, green, blue);
+                    graphics.pixel(Point(x + SCREEN_PADDING_LEFT, y + SCREEN_PADDING_TOP));
+                }
+            }
+            st7789.update(&graphics);
+            DEBUG_printf("Screen updated!\n");
         }
     }
 }
@@ -122,33 +126,8 @@ static void mqtt_connection_cb(mqtt_client_t *client, void *arg, mqtt_connection
     }
 }
 
-void mqtt_pub_request_cb(void *arg, err_t err) {
-    MQTT_CLIENT_T *state = (MQTT_CLIENT_T *)arg;
-    DEBUG_printf("mqtt_pub_request_cb: err %d\n", err);
-    state->received++;
-}
-
 void mqtt_sub_request_cb(void *arg, err_t err) {
     DEBUG_printf("mqtt_sub_request_cb: err %d\n", err);
-}
-
-err_t mqtt_test_publish(MQTT_CLIENT_T *state)
-{
-    char buffer[128];
-
-    sprintf(buffer, "{\"message\":\"hello from picow %d / %d\"}", state->received, state->counter);
-
-    err_t err;
-    u8_t qos = 0; /* 0 1 or 2, see MQTT specification.  AWS IoT does not support QoS 2 */
-    u8_t retain = 0;
-    cyw43_arch_lwip_begin();
-    err = mqtt_publish(state->mqtt_client, "pico_w/test", buffer, strlen(buffer), qos, retain, mqtt_pub_request_cb, state);
-    cyw43_arch_lwip_end();
-    if(err != ERR_OK) {
-        DEBUG_printf("Publish err: %d\n", err);
-    }
-
-    return err;
 }
 
 err_t mqtt_test_connect(MQTT_CLIENT_T *state) {
@@ -209,7 +188,7 @@ void mqtt_run_test(MQTT_CLIENT_T *state) {
                     if (!subscribed) {
                         mqtt_sub_unsub(
                             state->mqtt_client,
-                            "pico_w/recv",
+                            MQTT_TOPIC,
                             0,
                             mqtt_sub_request_cb,
                             0,
@@ -218,13 +197,6 @@ void mqtt_run_test(MQTT_CLIENT_T *state) {
                         subscribed = true;
                     }
 
-                    if (mqtt_test_publish(state) == ERR_OK) {
-                        if (state->counter != 0) {
-                            DEBUG_printf("published %d\n", state->counter);
-                        }
-                        timeout = make_timeout_time_ms(5000);
-                        state->counter++;
-                    } // else ringbuffer is full and we need to wait for messages to flush.
                     cyw43_arch_lwip_end();
                 } else {
                     // DEBUG_printf(".");
@@ -236,9 +208,16 @@ void mqtt_run_test(MQTT_CLIENT_T *state) {
 
 int main() {
     stdio_init_all();
-    while (!tud_cdc_connected()) {
-        sleep_ms(100);
-    }
+
+    // Clear screen.
+    graphics.set_pen(0, 0, 0);
+    graphics.clear();
+    st7789.update(&graphics);
+
+// Enable the loop below to wait for the serial connection.
+//    while (!tud_cdc_connected()) {
+//        sleep_ms(100);
+//    }
     printf("stdio initialised...\n");
 
     if (cyw43_arch_init()) {
